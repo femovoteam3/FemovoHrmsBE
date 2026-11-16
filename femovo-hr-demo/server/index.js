@@ -2761,11 +2761,12 @@ app.get('/api/roles', async (req, res) => {
     const formatted = rolesRes.rows
       .map(r => {
         const meta = SYSTEM_ROLE_DISPLAY[r.id];
-        if (!meta) return { ...r, user_count: Number(r.user_count) || 0 };
+        if (!meta) return { ...r, code: r.id, user_count: Number(r.user_count) || 0 };
         const hasPlaceholderName = !r.name || r.name === r.id;
         const hasPlaceholderDesc = !r.description || r.description === 'System role';
         return {
           ...r,
+          code: r.id,
           name: hasPlaceholderName ? meta.name : r.name,
           description: hasPlaceholderDesc ? meta.description : r.description,
           user_count: Number(r.user_count) || 0,

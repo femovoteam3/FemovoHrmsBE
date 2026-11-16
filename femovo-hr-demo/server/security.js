@@ -21,7 +21,7 @@ export async function hasPermission(user, module, action) {
 }
 
 export async function employeeScope(user, module, action = 'view') {
-  if (peopleManagers.includes(user.role) && await hasPermission(user, module, action)) return null;
+  if (await hasPermission(user, 'employees', 'view_sensitive') || (peopleManagers.includes(user.role) && await hasPermission(user, module, action))) return null;
   const ids = user.employeeId ? [user.employeeId] : [];
   if (['manager', 'head'].includes(user.role) && ['employees', 'attendance', 'leaves', 'training'].includes(module) && await hasPermission(user, module, action)) {
     const reports = await pool.query('SELECT id FROM employees WHERE manager_id=$1', [user.employeeId]);
@@ -50,9 +50,9 @@ export function routePolicy(route, method) {
         if (route.endsWith('/acknowledge')) req.body.employeeName = user.name;
       }
       if (route.startsWith('/api/auth/me') || ['/api/auth/change-pin', '/api/auth/logout'].includes(route)) return next();
-      if (route === '/api/auth/accounts') return administrators.includes(user.role) ? next() : deny();
+      if (route === '/api/auth/accounts') return (administrators.includes(user.role) || await hasPermission(user, 'permissions', 'view') || await hasPermission(user, 'employees', 'view')) ? next() : deny();
       if (route.startsWith('/api/files/')) return next(); // Record checks happen in the file service.
-      if (method === 'get' && ['/api/health', '/api/ready', '/api/requisitions', '/api/departments', '/api/masters'].includes(route)) return next();
+      if (method === 'get' && ['/api/health', '/api/ready', '/api/requisitions', '/api/departments', '/api/masters', '/api/roles'].includes(route)) return next();
       if (method === 'get' && route === '/api/roles/:id/permissions' && req.params.id === user.role) return next();
       if (route.startsWith('/api/resources') && method !== 'get' && user.role !== 'super_admin') {
         const requestedRole = typeof req.body?.access_role === 'string' ? req.body.access_role.trim() : req.body?.access_role;
@@ -69,7 +69,9 @@ export function routePolicy(route, method) {
         return can.manage_ats_users ? next() : deny();
       }
       if (/^\/api\/(roles|permissions|users|resources)(\/|$)/.test(route)) {
-        if (!administrators.includes(user.role)) return deny();
+        const canViewPerms = await hasPermission(user, 'permissions', 'view');
+        const canEditPerms = await hasPermission(user, 'permissions', 'edit_permissions');
+        if (!administrators.includes(user.role) && !canViewPerms && !canEditPerms) return deny();
         const checkPermWithFallback = async (primaryAction, fallbackAction) => {
           const perms = await getRolePermissionsMap(user.role);
           const overrides = await pool.query('SELECT permission_key, allowed FROM user_specific_permissions WHERE employee_id=$1', [user.employeeId]);
@@ -108,19 +110,19 @@ export function routePolicy(route, method) {
         };
         return next();
       }
-      if (route === '/api/stats') return await allow('dashboard', 'view_analytics', [...peopleManagers, 'head', 'manager']) ? next() : deny();
+      if (route === '/api/stats') return (await hasPermission(user, 'dashboard', 'view') || await hasPermission(user, 'dashboard', 'view_analytics')) ? next() : deny();
       if (route.startsWith('/api/employees')) {
         // Only a super admin may change a super admin's account or grant that role.
         const targetRole = req.params.id && method !== 'get' && !route.endsWith('/attendance') ? await accountRole(req.params.id) : null;
         if (targetRole === 'super_admin' && user.role !== 'super_admin') return deny();
-        if (route.endsWith('/credentials')) return req.params.id === user.employeeId || (administrators.includes(user.role) && await hasPermission(user, 'employees', method === 'get' ? 'view' : 'edit')) ? next() : deny();
-        const requestedRole = typeof req.body.access_role === 'string' ? req.body.access_role.trim() : req.body.access_role;
+        if (route.endsWith('/credentials')) return req.params.id === user.employeeId || await hasPermission(user, 'employees', method === 'get' ? 'view' : 'edit') ? next() : deny();
+        const requestedRole = typeof req.body?.access_role === 'string' ? req.body.access_role.trim() : req.body?.access_role;
         if (requestedRole === 'super_admin' && user.role !== 'super_admin') return deny();
-        if ((requestedRole != null && requestedRole !== (targetRole ?? 'employee')) || (method !== 'post' && req.body.password)) {
+        if (method !== 'post' && ((requestedRole != null && requestedRole !== targetRole) || req.body?.password)) {
           if (!administrators.includes(user.role)) return deny();
         }
         const action = method === 'post' ? 'add' : (method === 'delete' || route.endsWith('/status')) ? 'delete' : 'edit';
-        return await allow('employees', action, peopleManagers) ? next() : deny();
+        return await hasPermission(user, 'employees', action) ? next() : deny();
       }
       if (route.startsWith('/api/attendance')) {
         if (method === 'get') {
@@ -214,24 +216,22 @@ export function routePolicy(route, method) {
         return can.manage_ats_users ? next() : deny();
       }
       if (route.startsWith('/api/departments') && method !== 'get') {
-        if (!peopleManagers.includes(user.role)) return deny();
-        const perms = await getRolePermissionsMap(user.role);
-        if (perms.departments && 'manage' in perms.departments) {
-          return await hasPermission(user, 'departments', 'manage') ? next() : deny();
-        }
-        return await hasPermission(user, 'employees', 'edit') ? next() : deny();
+        const canManageDept = await hasPermission(user, 'departments', 'manage');
+        const canEditEmp = await hasPermission(user, 'employees', 'edit');
+        return canManageDept || canEditEmp ? next() : deny();
       }
       const rules = [
-        [/^\/api\/(departments|masters)/, 'employees', 'edit', peopleManagers],
-        [/^\/api\/exits/, 'exits', 'clearance_settlement', peopleManagers],
-        [/^\/api\/(announcements|kudos)/, 'notices', method === 'get' ? 'view' : /react|acknowledge|like/.test(route) ? 'view' : route.includes('kudos') ? 'send_kudos' : 'post_notice', null],
-        [/^\/api\/audit-logs/, 'audit', 'view', peopleManagers],
-        [/^\/api\/export\/employees/, 'employees', 'view_sensitive', peopleManagers],
-        [/^\/api\/export\/attendance/, 'attendance', 'view', peopleManagers],
-        [/^\/api\/(recruiters|recruitment)/, 'ats', 'view', null],
+        [/^\/api\/departments/, 'departments', method === 'get' ? 'view' : 'manage'],
+        [/^\/api\/masters/, 'employees', 'view'],
+        [/^\/api\/exits/, 'exits', 'clearance_settlement'],
+        [/^\/api\/(announcements|kudos)/, 'notices', method === 'get' ? 'view' : /react|acknowledge|like/.test(route) ? 'view' : route.includes('kudos') ? 'send_kudos' : 'post_notice'],
+        [/^\/api\/audit-logs/, 'audit', 'view'],
+        [/^\/api\/export\/employees/, 'employees', 'view_sensitive'],
+        [/^\/api\/export\/attendance/, 'attendance', 'view'],
+        [/^\/api\/(recruiters|recruitment)/, 'ats', 'view'],
       ];
       const rule = rules.find(([pattern]) => pattern.test(route));
-      return rule && await allow(rule[1], rule[2], rule[3]) ? next() : deny();
+      return rule && await hasPermission(user, rule[1], rule[2]) ? next() : deny();
     } catch (error) { next(error); }
   };
 }
